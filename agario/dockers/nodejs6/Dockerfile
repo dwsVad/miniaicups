@@ -1,4 +1,4 @@
-FROM ubuntu:16.04
+FROM node:8-alpine
 MAINTAINER Boris Kolganov <b.kolganov@corp.mail.ru>
 
 RUN curl -sL https://deb.nodesource.com/setup_9.x | bash - && \
