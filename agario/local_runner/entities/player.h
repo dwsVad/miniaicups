@@ -8,7 +8,7 @@
 class Player : public Circle
 {
 public:
-    enum State { CREATED, EATEN, EATER, BURST, FUSED, FUSER, SPLIT, EJECT };
+    enum State { CREATED, EATEN, EATER, BURST, FUSED, FUSER, SPLIT, EJECT, EATER_N_SPLIT, EATER_N_EJECT };
     State logical;
     bool is_fast;
     int fuse_timer;
@@ -19,7 +19,7 @@ protected:
     int color;
     int score;
     double vision_radius;
-    int cmd_x, cmd_y;
+    double cmd_x, cmd_y;
 
 public:
     explicit Player(int _id, double _x, double _y, double _radius, double _mass, const int fId=0) :
@@ -96,9 +96,9 @@ public:
 
     void apply_viscosity(double usual_speed) {
         if (is_fast && speed > usual_speed) {
-            speed -= Constants::instance().VISCOSITY;
+            speed = std::max(speed - Constants::instance().VISCOSITY, usual_speed);
         }
-        if (is_fast && speed < usual_speed) {
+        if (is_fast && speed <= usual_speed) {
             is_fast = false;
             speed = usual_speed;
         }
@@ -141,11 +141,11 @@ public:
     }
 
     bool can_see(const Circle *circle) {
-        double qdist = circle->calc_qdist(x, y);
-        if (qdist < vision_radius * vision_radius) {
-            return true;
-        }
-        return false;
+        double xVisionCenter = x + qCos(angle) * VIS_SHIFT;
+        double yVisionCenter = y + qSin(angle) * VIS_SHIFT;
+        double qdist = circle->calc_qdist(xVisionCenter, yVisionCenter);
+
+        return (qdist < (vision_radius + circle->getR()) * (vision_radius + circle->getR()));
     }
 
     void draw_vision(QPainter &painter) const {
@@ -171,23 +171,30 @@ public:
 
     double can_eat(Circle *food) const {
         if (food->is_player() && food->getId() == id) {
-            return INFINITY;
+            return -INFINITY;
         }
-        if (mass > food->getM() * MASS_EAT_FACTOR) {
-            double qdist = food->calc_qdist(x, y);
-            double tR = radius - food->getR() * RAD_EAT_FACTOR;
-            if (qdist < tR * tR) {
-                return qdist;
+        if (mass > food->getM() * MASS_EAT_FACTOR) { // eat anything
+            double dist = food->calc_dist(x, y);
+            if (dist - food->getR() + (food->getR() * 2) * DIAM_EAT_FACTOR < radius) {
+                return radius - dist;
             }
         }
-        return INFINITY;
+        return -INFINITY;
     }
 
     void eat(Circle *food, bool is_last=false) {
         mass += food->getM();
-        logical = State::EATER;
+        if (logical == State::SPLIT) {
+            logical = State::EATER_N_SPLIT;
+        } else if (logical == State::EJECT) {
+            logical = State::EATER_N_EJECT;
+        } else {
+            logical = State::EATER;
+        }
 
-        if (food->is_food()) {
+        if (food->is_my_eject(this)) {
+            return;
+        } else if (food->is_food()) {
             score += SCORE_FOR_FOOD;
         }
         else if (food->is_player()) {
@@ -286,39 +293,85 @@ public:
         return new_player;
     }
 
-    double tangent_projection(Player *c1, Player *c2, double dist) {
-        if (dist > 0 && c1->speed > 0) {
-            double speed_x = c1->speed * qCos(c1->angle);
-            double speed_y = c1->speed * qSin(c1->angle);
-
-            double norm_x = -(c1->y - c2->y), norm_y = c1->x - c2->x;
-            double scalar = norm_x * speed_x + norm_y * speed_y;
-            double cos_beta = scalar / dist / c1->speed;
-            return qAcos(cos_beta);
-        }
-        return 0.0;
-    }
-
     bool can_fuse(Player *frag) {
         double dist = frag->calc_dist(x, y);
         double nR = radius + frag->getR();
 
-        if (frag->fuse_timer > 0 && dist <= nR && !is_fast) {
-            double beta = tangent_projection(this, frag, dist);
-            if (qAbs(beta) < M_PI / 2) {
-                angle -= beta;
-            }
-//            speed *= qCos(beta);
+        return fuse_timer == 0 && frag->fuse_timer == 0 && dist <= nR;
+    }
+
+    void collisionCalc(Player *other) {
+        if (is_fast || other->is_fast) { // do not collide splits
+            return;
         }
-        if (frag->getM() < mass) {
-            if (frag->fuse_timer == 0 && dist <= nR) {
-                return true;
-            }
+        double dist = this->calc_dist(other->x, other->y);
+        if (dist >= radius + other->radius) {
+            return;
         }
-        return false;
+
+        // vector from centers
+        double collisionVectorX = this->x - other->x;
+        double collisionVectorY = this->y - other->y;
+        // normalize to 1
+        double vectorLen = qSqrt(collisionVectorX * collisionVectorX + collisionVectorY * collisionVectorY);
+        if (vectorLen < 1e-9) { // collision object in same point??
+            return;
+        }
+        collisionVectorX /= vectorLen;
+        collisionVectorY /= vectorLen;
+
+        double collisionForce = 1. - dist / (radius + other->radius);
+        collisionForce *= collisionForce;
+        collisionForce *= COLLISION_POWER;
+
+        double sumMass = getM() + other->getM();
+        // calc influence on us
+        {
+            double currPart = other->getM() / sumMass; // more influence on us if other bigger and vice versa
+
+            double dx = speed * qCos(angle);
+            double dy = speed * qSin(angle);
+            dx += collisionForce * currPart * collisionVectorX;
+            dy += collisionForce * currPart * collisionVectorY;
+            this->speed = qSqrt(dx * dx + dy * dy);
+            this->angle = qAtan2(dy, dx);
+        }
+
+        // calc influence on other
+        {
+            double otherPart = getM() / sumMass;
+
+            double dx = other->speed * qCos(other->angle);
+            double dy = other->speed * qSin(other->angle);
+            dx -= collisionForce * otherPart * collisionVectorX;
+            dy -= collisionForce * otherPart * collisionVectorY;
+            other->speed = qSqrt(dx * dx + dy * dy);
+            other->angle = qAtan2(dy, dx);
+        }
     }
 
     void fusion(Player *frag) {
+        double fragDX = frag->speed * qCos(frag->angle);
+        double fragDY = frag->speed * qSin(frag->angle);
+        double dX = speed * qCos(angle);
+        double dY = speed * qSin(angle);
+        double sumMass = mass + frag->mass;
+
+        double fragInfluence = frag->mass / sumMass;
+        double currInfluence = mass / sumMass;
+
+        // center with both parts influence
+        this->x = this->x * currInfluence + frag->x * fragInfluence;
+        this->y = this->y * currInfluence + frag->y * fragInfluence;
+
+        // new move vector with both parts influence
+        dX = dX * currInfluence + fragDX * fragInfluence;
+        dY = dY * currInfluence + fragDY * fragInfluence;
+
+        // new angle and speed, based on vectors
+        angle = qAtan2(dY, dX);
+        speed = qSqrt(dX * dX + dY * dY);
+
         mass += frag->getM();
         logical = State::FUSER;
     }
@@ -337,7 +390,7 @@ public:
         double ex = x + qCos(angle) * (radius + 1);
         double ey = y + qSin(angle) * (radius + 1);
 
-        Ejection *new_eject = new Ejection(eject_id, ex, ey, EJECT_RADIUS, EJECT_MASS);
+        Ejection *new_eject = new Ejection(eject_id, ex, ey, EJECT_RADIUS, EJECT_MASS, this->id);
         new_eject->set_impulse(EJECT_START_SPEED, angle);
 
         mass -= EJECT_MASS;
@@ -382,6 +435,7 @@ public:
     }
 
     void apply_direct(Direct direct, int max_x, int max_y) {
+        direct.limit();
         cmd_x = direct.x; cmd_y = direct.y;
         if (is_fast) return;
 
@@ -398,15 +452,7 @@ public:
         speed_x += (nx * max_speed - speed_x) * inertion / mass;
         speed_y += (ny * max_speed - speed_y) * inertion / mass;
 
-        if (speed_y != 0 && speed_x != 0) {
-            if (speed_x > 0) {
-                angle = qAtan(speed_y / qAbs(speed_x));
-            } else {
-                angle = M_PI - qAtan(speed_y / qAbs(speed_x));
-            }
-        } else {
-            angle = (speed_x >= 0)? 0 : M_PI;
-        }
+        angle = qAtan2(speed_y, speed_x);
 
         double new_speed = qSqrt(speed_x*speed_x + speed_y*speed_y);
         if (new_speed > max_speed) {
